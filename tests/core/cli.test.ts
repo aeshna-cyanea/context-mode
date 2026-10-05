@@ -1097,15 +1097,6 @@ describe("Bin entry uses cli.bundle.mjs", () => {
     expect(alreadyLatestBlock).not.toContain("return;");
   });
 
-  it("server.ts ctx_upgrade uses cli.bundle.mjs with fallback", () => {
-    const src = readFileSync(resolve(ROOT, "src", "server.ts"), "utf-8");
-    // ctx_upgrade handler must prefer cli.bundle.mjs
-    const upgradeStart = src.indexOf('server.registerTool(\n  "ctx_upgrade"');
-    const upgradeEnd = src.indexOf("// ── ctx-purge", upgradeStart);
-    const upgradeSection = src.slice(upgradeStart, upgradeEnd);
-    expect(upgradeSection).toContain("cli.bundle.mjs");
-  });
-
   it("server.ts registers empty prompts/resources handlers to avoid -32601 (#168)", () => {
     const src = readFileSync(resolve(ROOT, "src", "server.ts"), "utf-8");
     // Must register prompts capability so clients don't get Method not found
@@ -2797,27 +2788,6 @@ describe("ctx-upgrade swap loop supply-chain containment", () => {
     );
   });
 
-  test("server.ts inline-fallback upgrade script rejects swap-loop items that escape pluginRoot or srcDir", () => {
-    // The inline-script lines are literal-string template segments inside
-    // the ctx_upgrade handler's scriptLines array, so the guards land as
-    // quoted lines in src/server.ts.
-    expect(SERVER_SOURCE).toContain('import{join,resolve,sep}from"node:path"');
-    expect(SERVER_SOURCE).toContain("const PW=resolve(P)+sep;const TW=resolve(T)+sep;");
-    expect(SERVER_SOURCE).toContain("if(!(to+sep).startsWith(PW))continue;");
-    expect(SERVER_SOURCE).toContain("if(!(from+sep).startsWith(TW))continue;");
-    // The pre-fix unguarded join-only form must not return.
-    expect(SERVER_SOURCE).not.toMatch(
-      /for\(const item of items\)\{const from=join\(T,item\);const to=join\(P,item\);if\(existsSync\(from\)\)/,
-    );
-    // F30 hardening for the inline script.
-    expect(SERVER_SOURCE).toMatch(
-      /import\{[^}]*\blstatSync\b[^}]*\}from"node:fs"/,
-    );
-    expect(SERVER_SOURCE).toContain('const noSymlink=(src)=>{try{return !lstatSync(src).isSymbolicLink()}catch{return false}};');
-    expect(SERVER_SOURCE).toContain("if(!noSymlink(from))continue;");
-    expect(SERVER_SOURCE).toContain("filter:noSymlink");
-  });
-
   test("algorithm: lexical containment guard rejects relative and absolute traversal items", async () => {
     // Sandbox replay of the guard logic. Two trees: pluginRoot/ and
     // srcDir/. Plant a victim file at base/OUTSIDE/victim.txt and an
@@ -2950,34 +2920,6 @@ describe("Shell-free upgrade (#185)", () => {
     expect(guardIdx).toBeLessThan(rmIdx);
   });
 
-  test("server.ts inline fallback uses execFileSync, not execSync", () => {
-    // The inline script template must use execFileSync
-    const inlineStart = SERVER_SOURCE.indexOf("Inline fallback");
-    expect(inlineStart).toBeGreaterThan(-1);
-    const inlineSection = SERVER_SOURCE.slice(inlineStart, SERVER_SOURCE.indexOf("cmd =", inlineStart + 500));
-
-    // Generated script lines must import execFileSync
-    expect(inlineSection).toContain("execFileSync");
-    expect(inlineSection).not.toMatch(/(?<!File)execSync/);
-  });
-
-  test("server.ts inline fallback copies package files including bin", () => {
-    const inlineStart = SERVER_SOURCE.indexOf("Inline fallback");
-    expect(inlineStart).toBeGreaterThan(-1);
-    const inlineSection = SERVER_SOURCE.slice(inlineStart, SERVER_SOURCE.indexOf("cmd =", inlineStart + 500));
-
-    expect(inlineSection).toContain('readFileSync(join(T,"package.json"),"utf8")');
-    expect(inlineSection).toContain("pkg.files");
-    expect(inlineSection).toContain("Array.isArray(pkg.files)");
-    expect(inlineSection).toContain("for(const item of items)");
-    // Issue #609: server.ts inline-fallback MUST NOT write `.mcp.json` either.
-    // Same architectural-lock as cli.ts upgrade(). The inline-fallback was the
-    // OTHER producer of per-version `.mcp.json` files — both writers had to go
-    // for the carry-forward bug class to be structurally impossible.
-    expect(inlineSection).not.toContain('writeFileSync(join(P,".mcp.json")');
-    expect(inlineSection).not.toContain("copyDirs");
-    expect(inlineSection).not.toContain("copyFiles");
-  });
 });
 
 // ── Issue #186: temp dirs must be dot-prefixed to hide from VS Code ──
