@@ -8,7 +8,8 @@
  *   P1: Role (behavioral_directive) — always first, never truncated
  *   P2: Decisions (rules) — latest 5, overflow reduces to 3
  *   P3: Skills (active_skills) — unique names, latest 10
- *   P4: Intent (session_mode) — latest
+ *   P4: Session mode — explicit host override (see resolveSessionMode), else
+ *       the latest derived intent
  *
  * Hard cap: 500 tokens (~2000 chars at 4 chars/token).
  */
@@ -23,11 +24,60 @@ export function estimateTokens(text) {
 }
 
 /**
+ * Modes an explicit override may name, and the ceiling on what a host-supplied
+ * override can inject into the model's context. Deliberately permissive about
+ * the word (hosts own their own mode vocabulary) but strict about shape: no
+ * whitespace, no angle brackets, bounded length.
+ */
+const MODE_PATTERN = /^[a-z][a-z0-9_-]{0,15}$/;
+
+/**
+ * Explicit override wins over the punctuation-derived classification; without
+ * one the derived intent behaves exactly as before.
+ */
+function resolveMode(intent, modeOverride) {
+  if (typeof modeOverride === "string" && MODE_PATTERN.test(modeOverride)) {
+    return { mode: modeOverride, source: "explicit" };
+  }
+  if (intent && typeof intent.data === "string") {
+    const derived = intent.data.trim();
+    if (derived) return { mode: derived, source: "derived" };
+  }
+  return { mode: null, source: "none" };
+}
+
+/**
+ * Resolve the session mode a host should inject, without building the block.
+ *
+ * Hosts that surface the mode somewhere other than the injection (a status bar,
+ * a prompt line) need the same resolution the block uses, not a second
+ * implementation of it. Pass the same events array you would pass to
+ * buildAutoInjection, plus the host's explicit override if it has one.
+ *
+ * @param {Array<{category: string, data: string}>} events
+ * @param {string} [modeOverride]
+ * @returns {{mode: string|null, source: "explicit"|"derived"|"none"}}
+ */
+export function resolveSessionMode(events, modeOverride) {
+  let intent;
+  if (Array.isArray(events)) {
+    for (const e of events) {
+      if (e && e.category === "intent") intent = e;
+    }
+  }
+  return resolveMode(intent, modeOverride);
+}
+
+/**
  * Build auto-injection block from session events.
  * @param {Array<{category: string, data: string}>} events
+ * @param {{modeOverride?: string}} [opts] modeOverride — an explicit, host-owned
+ *   mode choice (e.g. Pi's `/mode` command). Wins over the derived intent for
+ *   this block only; the next call without an override is derived again.
  * @returns {string} XML block or empty string
  */
-export function buildAutoInjection(events) {
+export function buildAutoInjection(events, opts) {
+  const modeOverride = opts?.modeOverride;
   // Single O(N) pass instead of 4× O(N) Array.filter() loops. UserPromptSubmit
   // fires this on every prompt; with N up to 100 events the prior implementation
   // walked the array 4 times per prompt — wasteful on macOS, painful on Windows
@@ -92,9 +142,16 @@ export function buildAutoInjection(events) {
     budget -= estimateTokens(text);
   }
 
-  // P4: Intent (latest)
-  if (intent && budget > 20) {
-    parts.push(`<session_mode>${intent.data}</session_mode>`);
+  // P4: Session mode — explicit override if the host supplied one, else the
+  // latest derived intent. An explicit mode is labelled so the model can tell a
+  // user's choice from a punctuation guess.
+  const sessionMode = resolveMode(intent, modeOverride);
+  if (sessionMode.mode && budget > 20) {
+    parts.push(
+      sessionMode.source === "explicit"
+        ? `<session_mode source="explicit">${sessionMode.mode}</session_mode>`
+        : `<session_mode>${sessionMode.mode}</session_mode>`,
+    );
   }
 
   if (parts.length === 0) return "";

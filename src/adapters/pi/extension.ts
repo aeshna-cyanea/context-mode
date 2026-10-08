@@ -154,30 +154,78 @@ let _mcpBridge: BridgeHandle | null = null;
  */
 export let _mcpBridgeReady: Promise<void> = Promise.resolve();
 
-// Cached buildAutoInjection (500-token cap, prioritized).
-let _buildAutoInjection:
-  | ((events: Array<{ category: string; data: string }>) => string)
-  | null
-  | undefined = undefined;
+// Cached auto-injection helpers (500-token cap, prioritized). Loaded once from
+// hooks/auto-injection.mjs so the Pi adapter and the hook platforms share one
+// implementation of the session_state block.
+type AutoInjectionFn = (
+  events: Array<{ category: string; data: string }>,
+  opts?: { modeOverride?: string },
+) => string;
+
+type ResolveSessionModeFn = (
+  events: Array<{ category: string; data: string }>,
+  modeOverride?: string,
+) => { mode: string | null; source: "explicit" | "derived" | "none" };
+
+interface AutoInjectionModule {
+  buildAuto: AutoInjectionFn;
+  resolveMode: ResolveSessionModeFn;
+}
+
+let _autoInjection: AutoInjectionModule | null | undefined = undefined;
+
+/** Used when the host's hooks/ directory predates resolveSessionMode. */
+function fallbackResolveMode(
+  events: Array<{ category: string; data: string }>,
+  modeOverride?: string,
+): { mode: string | null; source: "explicit" | "derived" | "none" } {
+  let intent: { data: string } | undefined;
+  for (const e of events) if (e.category === "intent") intent = e;
+  if (modeOverride) return { mode: modeOverride, source: "explicit" };
+  if (intent?.data) return { mode: intent.data, source: "derived" };
+  return { mode: null, source: "none" };
+}
+
+async function getAutoInjection(
+  pluginRoot: string,
+): Promise<AutoInjectionModule | null> {
+  if (_autoInjection !== undefined) return _autoInjection;
+  try {
+    const mod = await import(
+      pathToFileURL(join(pluginRoot, "hooks", "auto-injection.mjs")).href
+    );
+    _autoInjection = mod?.buildAutoInjection
+      ? {
+          buildAuto: mod.buildAutoInjection as AutoInjectionFn,
+          resolveMode:
+            typeof mod.resolveSessionMode === "function"
+              ? (mod.resolveSessionMode as ResolveSessionModeFn)
+              : fallbackResolveMode,
+        }
+      : null;
+  } catch {
+    _autoInjection = null;
+  }
+  return _autoInjection ?? null;
+}
+
+// ── /mode one-shot ────────────────────────────────────
+//
+// `/mode <mode>` is a ONE-TIME switch. It overrides the punctuation-derived
+// session_mode for the next turn only, then disappears — the turn after that
+// is classified from the prompt again. Held in the extension closure instead
+// of the DB on purpose: a switch that outlived a Pi restart would be a stale
+// directive with no owner, and a sticky lock needs a counter to expire. The
+// derived intent events keep being recorded either way, so the explicit choice
+// never erases the session's actual signal — it only outranks it once.
+const MODE_CHOICES = ["investigate", "implement", "auto"] as const;
+const MODE_STATUS_KEY = "ctx-mode";
+let _pendingMode: string | null = null;
 
 // Pending context to inject via the 'context' hook (avoiding systemPrompt mutation
 // which breaks prefix prompt cache on DeepSeek/Anthropic/OpenAI).
 // See: https://github.com/mksglu/context-mode/issues/598
 let _pendingContext = "";
-async function getAutoInjection(
-  pluginRoot: string,
-): Promise<((events: Array<{ category: string; data: string }>) => string) | null> {
-  if (_buildAutoInjection !== undefined) return _buildAutoInjection;
-  try {
-    const mod = await import(
-      pathToFileURL(join(pluginRoot, "hooks", "auto-injection.mjs")).href
-    );
-    _buildAutoInjection = mod.buildAutoInjection;
-  } catch {
-    _buildAutoInjection = null;
-  }
-  return _buildAutoInjection ?? null;
-}
 
 // ── Helpers ──────────────────────────────────────────────
 
@@ -316,6 +364,32 @@ function handleCommandText(
   }
 
   return { text };
+}
+
+/**
+ * Render the effective session mode into Pi's footer status line
+ * (ctx.ui.setStatus → FooterComponent.getExtensionStatuses). Best-effort: a
+ * host without a UI simply skips it, and a missing mode clears the slot rather
+ * than leaving a stale one behind.
+ */
+function setModeStatus(
+  ctx: any,
+  resolved: { mode: string | null; source: string },
+): void {
+  const setStatus = ctx?.ui?.setStatus;
+  if (typeof setStatus !== "function") return;
+  try {
+    if (!resolved.mode) {
+      setStatus(MODE_STATUS_KEY, undefined);
+      return;
+    }
+    setStatus(
+      MODE_STATUS_KEY,
+      `mode: ${resolved.mode}${resolved.source === "explicit" ? " (explicit)" : ""}`,
+    );
+  } catch {
+    // best effort — a status bar is never worth breaking a turn
+  }
 }
 
 // ── Pi MCP bridge lazy bootstrap (#534, #809) ───────────
@@ -461,6 +535,34 @@ export default function piExtension(pi: any): void {
   const _attribution: Partial<ProjectAttribution> = { projectDir, source: "workspace_root", confidence: 0.98 };
 
   const db = getOrCreateDB(projectDir);
+
+  /**
+   * Effective session mode, including a pending `/mode` switch. Reads the same
+   * newest-50 window the turn builder uses, so what `/mode` reports is what the
+   * next turn will be given.
+   */
+  async function currentSessionMode(): Promise<{
+    mode: string | null;
+    source: "explicit" | "derived" | "none";
+  }> {
+    const pending = { mode: _pendingMode, source: _pendingMode ? "explicit" as const : "none" as const };
+    if (!db || !_sessionId) return pending;
+    try {
+      const events = db
+        .getRecentEvents(_sessionId, { minPriority: 3, limit: 50 })
+        .filter((e: any) => String(e.category ?? "") !== "role")
+        .map((e: any) => ({
+          category: String(e.category ?? ""),
+          data: String(e.data ?? ""),
+        }));
+      const auto = await getAutoInjection(pluginRoot);
+      return auto
+        ? auto.resolveMode(events, _pendingMode ?? undefined)
+        : fallbackResolveMode(events, _pendingMode ?? undefined);
+    } catch {
+      return pending;
+    }
+  }
 
   // ── 1. session_start — Initialize session ──────────────
 
@@ -690,16 +792,23 @@ export default function piExtension(pi: any): void {
           limit: 50,
         })
         .filter((e: any) => String(e.category ?? "") !== "role");
-      if (activeEvents.length > 0) {
-        const buildAuto = await getAutoInjection(pluginRoot);
+      // /mode one-shot: an explicit switch outranks the derived classification
+      // for exactly this turn, then is discarded.
+      const explicitMode = _pendingMode;
+      _pendingMode = null;
+      const mappedEvents = activeEvents.map((e: any) => ({
+        category: String(e.category ?? ""),
+        data: String(e.data ?? ""),
+      }));
+      const auto = await getAutoInjection(pluginRoot);
+      // An explicit mode counts even in a session with no priority>=3 events
+      // yet — otherwise `/mode implement` on a fresh session would be dropped.
+      if (activeEvents.length > 0 || explicitMode) {
         let memoryContext = "";
-        if (buildAuto) {
-          memoryContext = buildAuto(
-            activeEvents.map((e: any) => ({
-              category: String(e.category ?? ""),
-              data: String(e.data ?? ""),
-            })),
-          );
+        if (auto) {
+          memoryContext = auto.buildAuto(mappedEvents, {
+            modeOverride: explicitMode ?? undefined,
+          });
         }
         // Fallback (or if helper produced empty output): inline 500-token cap.
         if (!memoryContext) {
@@ -716,6 +825,15 @@ export default function piExtension(pi: any): void {
         }
         if (memoryContext) parts.push(memoryContext);
       }
+
+      // Status bar: show the mode this turn was actually given. The derived
+      // label used to be invisible — injected every turn, never surfaced — so
+      // a classification that stopped matching the work was invisible too. With
+      // it on the footer, `/mode <mode>` is one keystroke away.
+      const resolvedMode = auto
+        ? auto.resolveMode(mappedEvents, explicitMode ?? undefined)
+        : fallbackResolveMode(mappedEvents, explicitMode ?? undefined);
+      setModeStatus(ctx, resolvedMode);
 
       // Resume snapshot (only when present and unconsumed).
       const resume = db.getResume(_sessionId);
@@ -864,8 +982,11 @@ export default function piExtension(pi: any): void {
 
   // ── 7. session_shutdown — Cleanup old sessions ─────────
 
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (_event: any, ctx: any) => {
     try {
+      // A pending /mode switch belongs to the session that made it.
+      _pendingMode = null;
+      setModeStatus(ctx, { mode: null, source: "none" });
       if (_db) {
         _db.cleanupOldSessions(7);
       }
@@ -903,6 +1024,78 @@ export default function piExtension(pi: any): void {
   });
 
   // ── 8. Slash commands ──────────────────────────────────
+
+  // /mode — one-time switch for the injected <session_mode>.
+  //
+  // Without it the mode is a punctuation guess re-derived every turn (a `?`
+  // anywhere in the prompt means "investigate"; otherwise a short prompt means
+  // "implement"; a prompt over 60 codepoints with no `?` records nothing at all
+  // and the label simply stays where it was). That is fine as a default and
+  // useless when autumn already knows which mode she wants. The switch outranks
+  // the derived value for exactly one turn and is then discarded — no counter,
+  // no sticky lock, and the derived events keep being recorded either way.
+  pi.registerCommand("mode", {
+    description:
+      "Switch the session mode for the next turn: /mode investigate | implement | auto",
+    getArgumentCompletions: (argumentPrefix: string) => {
+      const prefix = String(argumentPrefix ?? "").trimStart().toLowerCase();
+      const items = MODE_CHOICES.map((choice) => ({
+        value: `${choice} `,
+        label: choice,
+        description:
+          choice === "auto"
+            ? "stop overriding; classify from the prompt again"
+            : `next turn: ${choice}`,
+      }));
+      const filtered = prefix ? items.filter((i) => i.label.startsWith(prefix)) : items;
+      return filtered.length > 0 ? filtered : null;
+    },
+    handler: async (argsOrCtx: unknown, maybeCtx: unknown) => {
+      const ctx = resolveCommandContext(argsOrCtx, maybeCtx);
+      const raw = typeof argsOrCtx === "string" ? argsOrCtx.trim() : "";
+      const [token, ...rest] = raw.split(/\s+/).filter(Boolean);
+
+      if (token && !MODE_CHOICES.includes(token as (typeof MODE_CHOICES)[number])) {
+        const current = await currentSessionMode();
+        return handleCommandText(
+          `mode: unknown argument "${token}" — /mode investigate | implement | auto` +
+            (current.mode ? ` (still ${current.mode})` : ""),
+          ctx,
+        );
+      }
+
+      if (token && token !== "auto") {
+        _pendingMode = token;
+        setModeStatus(ctx, { mode: token, source: "explicit" });
+        // Text after the mode is a real instruction, not noise — keep it.
+        const trailing = rest.join(" ").trim();
+        if (trailing && typeof pi.sendUserMessage === "function") {
+          try {
+            pi.sendUserMessage(trailing);
+          } catch {
+            // best effort — the mode switch itself already landed
+          }
+        }
+        return handleCommandText(`mode: ${token} (explicit, next turn)`, ctx);
+      }
+
+      // `/mode auto` releases the override; bare `/mode` just reports state.
+      _pendingMode = null;
+      const current = await currentSessionMode();
+      setModeStatus(ctx, current);
+      if (token === "auto") {
+        return handleCommandText(
+          `mode: derived${current.mode ? ` (${current.mode})` : ""}`,
+          ctx,
+        );
+      }
+      return handleCommandText(
+        `${current.mode ? `mode: ${current.mode}${current.source === "explicit" ? " (explicit, next turn)" : " (derived)"}` : "mode: none recorded this session"}` +
+          " — /mode investigate | implement | auto",
+        ctx,
+      );
+    },
+  });
 
   pi.registerCommand("ctx-stats", {
     description: "Show context-mode session statistics",
