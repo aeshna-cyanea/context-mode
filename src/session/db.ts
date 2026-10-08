@@ -663,6 +663,8 @@ const S = {
   getEventsByType: "getEventsByType",
   getEventsByPriority: "getEventsByPriority",
   getEventsByTypeAndPriority: "getEventsByTypeAndPriority",
+  getRecentEvents: "getRecentEvents",
+  getRecentEventsByPriority: "getRecentEventsByPriority",
   getEventCount: "getEventCount",
   getLatestAttributedProject: "getLatestAttributedProject",
   checkDuplicate: "checkDuplicate",
@@ -948,6 +950,22 @@ export class SessionDB extends SQLiteBase {
               bytes_avoided, bytes_returned,
               source_hook, created_at, data_hash
        FROM session_events WHERE session_id = ? AND type = ? AND priority >= ? ORDER BY id ASC LIMIT ?`);
+
+    // Newest-N window: DESC + LIMIT picks the most recent rows, then the
+    // caller-side reverse restores chronological order. See getRecentEvents().
+    p(S.getRecentEvents,
+      `SELECT id, session_id, type, category, priority, data,
+              project_dir, attribution_source, attribution_confidence,
+              bytes_avoided, bytes_returned,
+              source_hook, created_at, data_hash
+       FROM session_events WHERE session_id = ? ORDER BY id DESC LIMIT ?`);
+
+    p(S.getRecentEventsByPriority,
+      `SELECT id, session_id, type, category, priority, data,
+              project_dir, attribution_source, attribution_confidence,
+              bytes_avoided, bytes_returned,
+              source_hook, created_at, data_hash
+       FROM session_events WHERE session_id = ? AND priority >= ? ORDER BY id DESC LIMIT ?`);
 
     p(S.getEventCount,
       `SELECT COUNT(*) AS cnt FROM session_events WHERE session_id = ?`);
@@ -1323,6 +1341,38 @@ export class SessionDB extends SQLiteBase {
       return this.stmt(S.getEventsByPriority).all(sessionId, minPriority, limit) as StoredEvent[];
     }
     return this.stmt(S.getEvents).all(sessionId, limit) as StoredEvent[];
+  }
+
+  /**
+   * Retrieve the NEWEST-N window of a session's events, in chronological order.
+   *
+   * Why this exists: `getEvents()` is `ORDER BY id ASC LIMIT n`, so with a
+   * limit it returns the OLDEST n rows. A per-turn context builder calling
+   * `getEvents(session, { minPriority: 3, limit: 50 })` therefore reads the
+   * first 50 high-priority events the session ever produced. Once a session
+   * passes 50 such events the injected block stops moving: every later
+   * decision, skill, and intent falls outside the window and the block freezes
+   * on its own oldest contents. Measured on a live 1000-event session: the
+   * oldest-50 window reported `investigate` while the three newest intent
+   * events all said `implement`.
+   *
+   * This variant selects the newest n (`ORDER BY id DESC LIMIT n`) and reverses
+   * back to chronological order, so downstream "latest 5 decisions" / "latest
+   * 10 skills" slicing means latest-in-time. `getEvents()` keeps its oldest-
+   * first contract for callers that page from the beginning.
+   */
+  getRecentEvents(
+    sessionId: string,
+    opts?: { minPriority?: number; limit?: number },
+  ): StoredEvent[] {
+    const limit = opts?.limit ?? 1000;
+    const minPriority = opts?.minPriority;
+
+    if (minPriority === undefined) {
+      return (this.stmt(S.getRecentEvents).all(sessionId, limit) as StoredEvent[]).reverse();
+    }
+    return (this.stmt(S.getRecentEventsByPriority)
+      .all(sessionId, minPriority, limit) as StoredEvent[]).reverse();
   }
 
   /**

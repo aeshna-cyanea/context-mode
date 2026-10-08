@@ -1434,3 +1434,98 @@ describe("session-resume category", () => {
     expect(events[0].data).toContain("10");
   });
 });
+
+// ════════════════════════════════════════════
+// SLICE: NEWEST-N WINDOW (getRecentEvents)
+// ════════════════════════════════════════════
+
+describe("getRecentEvents — newest-N window", () => {
+  /** 60 priority-4 events; the last 5 say "implement", the rest "investigate". */
+  function seedIntentWindow(db: SessionDB, sid: string, total = 60, newestImplement = 5) {
+    for (let i = 0; i < total; i++) {
+      const mode = i >= total - newestImplement ? "implement" : "investigate";
+      db.insertEvent(
+        sid,
+        { type: "intent", category: "intent", data: `intent-${i}-${mode}`, priority: 4 },
+        "UserPromptSubmit",
+      );
+    }
+  }
+
+  test("getEvents + limit returns the OLDEST rows — the contract getRecentEvents exists to escape", () => {
+    const db = createTestDB();
+    const sid = "recent-window-oldest";
+    seedIntentWindow(db, sid);
+
+    const window = db.getEvents(sid, { minPriority: 3, limit: 50 });
+    expect(window).toHaveLength(50);
+    // The five newest events never enter the window: the block is frozen on
+    // the session's oldest contents, which is the bug being fixed.
+    expect(window[window.length - 1].data).toContain("investigate");
+    expect(window.some((e) => e.data.includes("implement"))).toBe(false);
+  });
+
+  test("getRecentEvents returns the NEWEST rows, restored to chronological order", () => {
+    const db = createTestDB();
+    const sid = "recent-window-newest";
+    seedIntentWindow(db, sid);
+
+    const window = db.getRecentEvents(sid, { minPriority: 3, limit: 50 });
+    expect(window).toHaveLength(50);
+    expect(window[window.length - 1].data).toContain("implement");
+    expect(window.filter((e) => e.data.includes("implement"))).toHaveLength(5);
+    for (let i = 1; i < window.length; i++) {
+      expect(window[i].id).toBeGreaterThan(window[i - 1].id);
+    }
+  });
+
+  test("minPriority still filters, and low-priority rows are excluded from the window", () => {
+    const db = createTestDB();
+    const sid = "recent-window-priority";
+    db.insertEvent(sid, { type: "noise", category: "pi", data: "low-priority-noise", priority: 1 });
+    seedIntentWindow(db, sid, 10, 2);
+
+    const window = db.getRecentEvents(sid, { minPriority: 3, limit: 50 });
+    expect(window).toHaveLength(10);
+    expect(window.some((e) => e.category === "pi")).toBe(false);
+  });
+
+  test("limit larger than the session returns everything, chronological", () => {
+    const db = createTestDB();
+    const sid = "recent-window-short";
+    seedIntentWindow(db, sid, 3, 1);
+
+    const window = db.getRecentEvents(sid, { minPriority: 3, limit: 50 });
+    expect(window).toHaveLength(3);
+    expect(window.map((e) => e.data)).toEqual([
+      "intent-0-investigate",
+      "intent-1-investigate",
+      "intent-2-implement",
+    ]);
+  });
+
+  test("without minPriority the window spans all priorities", () => {
+    const db = createTestDB();
+    const sid = "recent-window-all";
+    db.insertEvent(sid, { type: "noise", category: "pi", data: "low-priority-noise", priority: 1 });
+    seedIntentWindow(db, sid, 4, 1);
+
+    const window = db.getRecentEvents(sid, { limit: 3 });
+    expect(window).toHaveLength(3);
+    expect(window[0].category).toBe("intent");
+    expect(window[window.length - 1].data).toContain("implement");
+  });
+
+  test("getEvents keeps its oldest-first contract (no silent behavior change)", () => {
+    const db = createTestDB();
+    const sid = "recent-window-legacy";
+    seedIntentWindow(db, sid, 6, 2);
+
+    const legacy = db.getEvents(sid, { minPriority: 3, limit: 3 });
+    expect(legacy.map((e) => e.data)).toEqual([
+      "intent-0-investigate",
+      "intent-1-investigate",
+      "intent-2-investigate",
+    ]);
+  });
+});

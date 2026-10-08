@@ -675,8 +675,17 @@ export default function piExtension(pi: any): void {
       // inescapable per-turn standing order. Role events stay in the DB and
       // remain queryable via ctx_search(source: "session-events"); intent,
       // skills, decisions, and the resume snapshot are unaffected.
+      //
+      // getRecentEvents, not getEvents: `getEvents` is `ORDER BY id ASC LIMIT n`,
+      // so a limited read returns the OLDEST n rows. With limit 50 the whole
+      // active_memory block froze on the session's first 50 priority>=3 events
+      // and every later decision, skill, and intent became invisible — the
+      // injected <session_mode> kept reporting a days-old classification while
+      // the newest intent events said otherwise. getRecentEvents takes the
+      // newest 50 and restores chronological order, which is what the
+      // "latest 5 decisions" / "latest 10 skills" slicing downstream assumes.
       const activeEvents = db
-        .getEvents(_sessionId, {
+        .getRecentEvents(_sessionId, {
           minPriority: 3,
           limit: 50,
         })
