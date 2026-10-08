@@ -392,6 +392,41 @@ function setModeStatus(
   }
 }
 
+/**
+ * Opt-out for the unsolicited per-turn context the Pi adapter injects.
+ *
+ * context-mode steers as well as compresses: every Pi turn gets a fixed routing
+ * anchor line and a `<session_state>` block holding derived rules, skills, and a
+ * session mode classified from prompt punctuation. That is a design choice, not
+ * a correctness requirement, and a host is entitled to the compression without
+ * the commentary.
+ *
+ *   CONTEXT_MODE_PI_SESSION_STATE=off   → no routing anchor, no session_state /
+ *                                         active_memory block
+ *   unset / empty / unrecognized        → upstream behavior, byte-identical
+ *   (off-values: off, 0, false, no — trimmed, case-insensitive)
+ *
+ * Deliberately narrow. It does NOT disable: the ctx_* tools or the MCP bridge,
+ * tool-output redirection, the resume snapshot (a compaction handoff, not
+ * commentary), or the footer status line (visible to the human, never sent to
+ * the model). It only turns off what context-mode writes into the transcript
+ * that the human did not ask for.
+ *
+ * Read per turn rather than at module load so a host can flip it between
+ * sessions in the same process, and so tests do not have to win a race against
+ * the module cache.
+ *
+ * Exported for tests.
+ */
+export function piSessionStateDisabled(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  const raw = env.CONTEXT_MODE_PI_SESSION_STATE;
+  if (typeof raw !== "string") return false;
+  const value = raw.trim().toLowerCase();
+  return value === "off" || value === "0" || value === "false" || value === "no";
+}
+
 // ── Pi MCP bridge lazy bootstrap (#534, #809) ───────────
 //
 // Pi loads extensions in several CLI paths that never dispatch an agent turn:
@@ -757,12 +792,18 @@ export default function piExtension(pi: any): void {
       // already tell the model what each tool does. This anchor gives the
       // deliberate choice (which tool for which scenario) without the full
       // block/redirect/memory/tool-selection hierarchy.
-      parts.push(
-        "context-mode active. Hierarchy: ctx_batch_execute > ctx_execute > ctx_execute_file > ctx_search. " +
-        "Read/edit files → ctx_execute_file. Multi-command research → ctx_batch_execute. " +
-        "Web pages → ctx_fetch_and_index then ctx_search. Index docs → ctx_index. " +
-        "Stats → ctx_stats. Doctor → ctx_doctor. Upgrade → ctx_upgrade. Purge → ctx_purge."
-      );
+      //
+      // CONTEXT_MODE_PI_SESSION_STATE=off suppresses this and the session_state
+      // block below: the host wants the compression without the commentary.
+      const perTurnOff = piSessionStateDisabled();
+      if (!perTurnOff) {
+        parts.push(
+          "context-mode active. Hierarchy: ctx_batch_execute > ctx_execute > ctx_execute_file > ctx_search. " +
+          "Read/edit files → ctx_execute_file. Multi-command research → ctx_batch_execute. " +
+          "Web pages → ctx_fetch_and_index then ctx_search. Index docs → ctx_index. " +
+          "Stats → ctx_stats. Doctor → ctx_doctor. Upgrade → ctx_upgrade. Purge → ctx_purge."
+        );
+      }
 
       // Pi-3 + Pi-4: Always build active_memory (not just post-compact),
       // capped at 500 tokens via buildAutoInjection. Falls back to inline
@@ -803,7 +844,8 @@ export default function piExtension(pi: any): void {
       const auto = await getAutoInjection(pluginRoot);
       // An explicit mode counts even in a session with no priority>=3 events
       // yet — otherwise `/mode implement` on a fresh session would be dropped.
-      if (activeEvents.length > 0 || explicitMode) {
+      // The whole block is skipped when the host opted out of per-turn context.
+      if (!perTurnOff && (activeEvents.length > 0 || explicitMode)) {
         let memoryContext = "";
         if (auto) {
           memoryContext = auto.buildAuto(mappedEvents, {
