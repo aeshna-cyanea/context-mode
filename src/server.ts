@@ -1247,6 +1247,85 @@ const bunNote = hasBunRuntime()
   : "";
 
 // ─────────────────────────────────────────────────────────
+// ctx_execute / ctx_execute_file `language` field — opt-in default
+//
+// Upstream, `language` is a required field whose value is obvious in almost
+// every call, so omitting it costs a whole round trip on a schema-validation
+// rejection ("language: must have required properties language").
+//
+// CONTEXT_MODE_DEFAULT_LANGUAGE opts out of that: when it is set to a valid
+// language, `language` becomes optional and zod fills the default during
+// parse, so every handler still receives a concrete language and no call
+// site changes.
+//
+// When the variable is UNSET — or set to something outside LANGUAGE_VALUES —
+// the field is emitted exactly as upstream emits it: required, same
+// description string, same JSON Schema. This fork adds an opt-in and
+// otherwise stays byte-identical to upstream, so there is no silent behaviour
+// change to re-verify at every upstream sync.
+// ─────────────────────────────────────────────────────────
+const LANGUAGE_VALUES = [
+  "javascript",
+  "typescript",
+  "python",
+  "shell",
+  "ruby",
+  "go",
+  "rust",
+  "php",
+  "perl",
+  "r",
+  "elixir",
+  "csharp",
+] as const;
+
+type LanguageValue = (typeof LANGUAGE_VALUES)[number];
+
+/**
+ * Resolve the opt-in default language from an environment object.
+ *
+ * Pure and env-injected so it is testable without spawning the server:
+ * the module-level `DEFAULT_LANGUAGE` is read once at load, which no test
+ * can re-evaluate.
+ *
+ * Returns `undefined` for an unset or invalid value — which is not "fall back
+ * to javascript", it is "emit the upstream field unchanged". Matching is
+ * trimmed and case-insensitive so `CONTEXT_MODE_DEFAULT_LANGUAGE=PYTHON` is
+ * not a silent no-op; anything outside LANGUAGE_VALUES still returns undefined
+ * rather than surfacing as a runtime error far from the config that caused it.
+ */
+export function resolveDefaultLanguage(
+  env: NodeJS.ProcessEnv = process.env,
+): LanguageValue | undefined {
+  const raw = env.CONTEXT_MODE_DEFAULT_LANGUAGE?.trim().toLowerCase();
+  if (raw && (LANGUAGE_VALUES as readonly string[]).includes(raw)) {
+    return raw as LanguageValue;
+  }
+  return undefined;
+}
+
+const DEFAULT_LANGUAGE = resolveDefaultLanguage();
+
+/**
+ * The `language` field shared by ctx_execute and ctx_execute_file.
+ *
+ * With a resolved default: optional, carries `default`, and the description
+ * names the default. Without one: the upstream field, byte for byte.
+ */
+export function languageField(
+  defaultLanguage: LanguageValue | undefined = DEFAULT_LANGUAGE,
+) {
+  return defaultLanguage
+    ? z
+        .enum(LANGUAGE_VALUES)
+        .default(defaultLanguage)
+        .describe(
+          `Runtime language (optional — omitted calls default to ${defaultLanguage})`,
+        )
+    : z.enum(LANGUAGE_VALUES).describe("Runtime language");
+}
+
+// ─────────────────────────────────────────────────────────
 // Helper: smart snippet extraction — returns windows around
 // matching query terms instead of dumb truncation
 //
@@ -1690,22 +1769,7 @@ RETURNS:
 EXAMPLE: ctx_execute(language: "javascript", code: "const out = require('child_process').execSync('npm test', {encoding:'utf8', stdio:['ignore','pipe','pipe']}); console.log(out.split('\\\\n').filter(l => /(FAIL|✗|×|Error:|Tests +.*(failed|passed))/i.test(l)).slice(0, 60).join('\\\\n'))")
 EXAMPLE: ctx_execute(language: "javascript", code: "const out = require('child_process').execSync('gh issue list --json number,title --limit 100', {encoding:'utf8'}); const hooks = JSON.parse(out).filter(i => /hook|routing/i.test(i.title)); console.log(\`\${hooks.length} hook-related issues\`)")`,
     inputSchema: z.object({
-      language: z
-        .enum([
-          "javascript",
-          "typescript",
-          "python",
-          "shell",
-          "ruby",
-          "go",
-          "rust",
-          "php",
-          "perl",
-          "r",
-          "elixir",
-          "csharp",
-        ])
-        .describe("Runtime language"),
+      language: languageField(),
       code: z
         .string()
         .describe(
@@ -2077,22 +2141,7 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
       path: z
         .string()
         .describe("Absolute file path or relative to project root"),
-      language: z
-        .enum([
-          "javascript",
-          "typescript",
-          "python",
-          "shell",
-          "ruby",
-          "go",
-          "rust",
-          "php",
-          "perl",
-          "r",
-          "elixir",
-          "csharp",
-        ])
-        .describe("Runtime language"),
+      language: languageField(),
       code: z
         .string()
         .describe(
